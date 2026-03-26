@@ -1,0 +1,64 @@
+## Sensitive configuration - never commit real credentials
+appsettings.json
+appsettings.*.json
+!appsettings.sample.json
+local.settings.json
+*.local.json
+.env
+.env.*
+
+## Build output
+bin/
+obj/
+
+## Visual Studio files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+## Visual Studio Code
+.vscode/
+!.vscode/extensions.json
+
+## NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+## MSBuild
+*.pidb
+*.svclog
+*.scc
+
+## Rider / JetBrains
+.idea/
+*.sln.iml
+
+## Test results
+TestResults/
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+coverage*/
+
+## Publish profiles
+**/Properties/PublishProfiles/
+PublishScripts/
+
+## Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+## Logs
+*.log
+logs/

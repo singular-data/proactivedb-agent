@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "SingularData.Proactive.SqlMonitor.Service": {
+      "commandName": "Project",
+      "commandLineArgs": "-c"
+    }
+  }
+}
