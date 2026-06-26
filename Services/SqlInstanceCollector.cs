@@ -1,7 +1,6 @@
 using System.Data;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using SingularData.Proactive.SqlMonitor.Service.Configuration;
 
 namespace SingularData.Proactive.SqlMonitor.Service.Services;
@@ -12,9 +11,7 @@ namespace SingularData.Proactive.SqlMonitor.Service.Services;
 /// All queries use CommandTimeout = 10s and NOLOCK where applicable to avoid
 /// impacting the monitored server.
 /// </summary>
-public sealed class SqlInstanceCollector(
-    ILogger<SqlInstanceCollector> logger,
-    IOptions<SqlMonitorOptions> options)
+public sealed class SqlInstanceCollector(ILogger<SqlInstanceCollector> logger)
 {
     // Idle wait types that add noise — same exclusion list as Datadog's SQL Server check
     private static readonly HashSet<string> IdleWaitTypes = new(StringComparer.OrdinalIgnoreCase)
@@ -33,14 +30,18 @@ public sealed class SqlInstanceCollector(
         "WAIT_XTP_OFFLINE_CKPT_NEW_LOG", "XIO_IDLE"
     };
 
-    public async Task<SqlInstanceHealthSnapshot> CollectAsync(CancellationToken ct)
+    public async Task<SqlInstanceHealthSnapshot> CollectAsync(SqlInstanceConfig instance, CancellationToken ct)
     {
-        var cs = new SqlConnectionStringBuilder(options.Value.ConnectionString);
-        var snapshot = new SqlInstanceHealthSnapshot { ServerName = cs.DataSource };
+        var cs = new SqlConnectionStringBuilder(instance.ConnectionString);
+        var snapshot = new SqlInstanceHealthSnapshot
+        {
+            InstanceName = instance.Name,
+            ServerName   = cs.DataSource
+        };
 
         try
         {
-            await using var conn = new SqlConnection(options.Value.ConnectionString);
+            await using var conn = new SqlConnection(instance.ConnectionString);
             await conn.OpenAsync(ct);
             snapshot.IsAvailable = true;
 
@@ -52,15 +53,15 @@ public sealed class SqlInstanceCollector(
             await CollectWaitStatsAsync(conn, snapshot, ct);
 
             logger.LogInformation(
-                "SQL instance health collected — server={Server} sessions={Sessions} blocked={Blocked}",
-                snapshot.ServerName, snapshot.SessionsTotal, snapshot.SessionsBlocked);
+                "[{Instance}] SQL instance health collected — server={Server} sessions={Sessions} blocked={Blocked}",
+                instance.Name, snapshot.ServerName, snapshot.SessionsTotal, snapshot.SessionsBlocked);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             snapshot.IsAvailable = false;
             snapshot.ErrorMessage = $"{ex.GetType().Name}: {ex.Message}";
             logger.LogWarning(ex,
-                "SQL instance health collection failed for {Server}", cs.DataSource);
+                "[{Instance}] SQL instance health collection failed for {Server}", instance.Name, cs.DataSource);
         }
 
         return snapshot;
@@ -252,6 +253,7 @@ public sealed class SqlInstanceCollector(
 public sealed class SqlInstanceHealthSnapshot
 {
     public DateTime CollectedAtUtc        { get; set; } = DateTime.UtcNow;
+    public string  InstanceName          { get; set; } = string.Empty;
     public string  ServerName            { get; set; } = string.Empty;
     public bool    IsAvailable           { get; set; }
     public string? ErrorMessage          { get; set; }

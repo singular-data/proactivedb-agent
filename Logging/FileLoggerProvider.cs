@@ -28,14 +28,15 @@ public sealed class FileLoggerProvider : ILoggerProvider
     {
         try
         {
-            var cutoff = DateTime.UtcNow.AddDays(-RetentionDays);
+            // Usa hora local para manter coerência com o nome dos ficheiros (DateTime.Now).
+            var cutoff = DateTime.Now.AddDays(-RetentionDays);
             foreach (var file in Directory.EnumerateFiles(_logDirectory, "Collector_*.log"))
             {
-                if (File.GetLastWriteTimeUtc(file) < cutoff)
+                if (File.GetLastWriteTime(file) < cutoff)
                     File.Delete(file);
             }
         }
-        catch { /* non-fatal — log rotation failure must not prevent the service from starting */ }
+        catch { /* non-fatal — falha na rotação de logs não deve impedir o arranque do serviço */ }
     }
 
     public ILogger CreateLogger(string categoryName) =>

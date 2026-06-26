@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Net.Http.Headers;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Diagnostics;
@@ -22,6 +23,8 @@ public sealed class ProactiveApiClient(
 {
     private readonly string _databaseName =
         new SqlConnectionStringBuilder(options.Value.ConnectionString).InitialCatalog;
+
+    private readonly string? _apiKeyPrefix = ExtractApiKeyPrefix(options.Value.ApiKey);
 
     // Matches TelemetryDataRequest on the BackendApi
     private sealed class TelemetryBatchItem
@@ -116,7 +119,15 @@ public sealed class ProactiveApiClient(
             logger.LogWarning(
                 "API returned {Status} for [{Table}] after {ElapsedMs:F0} ms: {Body}",
                 (int)response.StatusCode, tableName, elapsedMs, body);
-            return (false, $"HTTP {(int)response.StatusCode}: {Truncate(body, 200)}");
+            return (false, $"HTTP {(int)response.StatusCode}: {StringHelpers.Truncate(body, 200)}");
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // HttpClient's own timeout fired (not the cycle CTS) — treat as transient API failure
+            logger.LogWarning(
+                "HTTP timeout sending batch for [{Table}] on machine {Machine} to {Url} — batch may be too large or API too slow",
+                tableName, hostName, httpClient.BaseAddress);
+            return (false, "HTTP request timed out");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -159,7 +170,7 @@ public sealed class ProactiveApiClient(
                 var body = await response.Content.ReadAsStringAsync(ct);
                 logger.LogWarning(
                     "Host registration returned {Status} for '{Hostname}': {Body}",
-                    (int)response.StatusCode, payload.Hostname, Truncate(body, 200));
+                    (int)response.StatusCode, payload.Hostname, StringHelpers.Truncate(body, 200));
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -187,7 +198,7 @@ public sealed class ProactiveApiClient(
                 var responseBody = await response.Content.ReadAsStringAsync(ct);
                 logger.LogWarning(
                     "Email alert failed with {Status}: {Body}",
-                    (int)response.StatusCode, Truncate(responseBody, 200));
+                    (int)response.StatusCode, StringHelpers.Truncate(responseBody, 200));
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -250,10 +261,27 @@ public sealed class ProactiveApiClient(
 
     private sealed class AgentRegistrationPayload
     {
-        [JsonPropertyName("hostName")]    public string HostName    { get; init; } = string.Empty;
-        [JsonPropertyName("serviceName")] public string ServiceName { get; init; } = "SqlMonitor";
+        [JsonPropertyName("hostName")]     public string  HostName     { get; init; } = string.Empty;
+        [JsonPropertyName("serviceName")]  public string  ServiceName  { get; init; } = "SqlMonitor";
         [JsonPropertyName("agentVersion")] public string? AgentVersion { get; init; }
-        [JsonPropertyName("osInfo")]      public string? OsInfo     { get; init; }
+        [JsonPropertyName("osInfo")]       public string? OsInfo       { get; init; }
+        [JsonPropertyName("apiKeyPrefix")] public string? ApiKeyPrefix { get; init; }
+    }
+
+    /// <summary>Versão do assembly lida uma única vez em tempo de execução.</summary>
+    private static readonly string? AgentVersion =
+        Assembly.GetExecutingAssembly().GetName().Version?.ToString();
+
+    /// <summary>
+    /// Extrai o prefixo da API key (ex: "pdb_96f3494f" dos primeiros 12 chars de "pdb_96f3494f1234567890abcdef").
+    /// Retorna null se a API key for inválida ou não seguir o formato esperado.
+    /// </summary>
+    private static string? ExtractApiKeyPrefix(string? apiKey)
+    {
+        if (string.IsNullOrWhiteSpace(apiKey) || apiKey.Length < 12 || !apiKey.StartsWith("pdb_"))
+            return null;
+
+        return apiKey[..12]; // pdb_ + 8 caracteres do hash
     }
 
     private sealed class AgentRegistrationEnvelope
@@ -276,9 +304,11 @@ public sealed class ProactiveApiClient(
         {
             var payload = new AgentRegistrationPayload
             {
-                HostName    = Environment.MachineName,
-                ServiceName = "SqlMonitor",
-                OsInfo      = System.Runtime.InteropServices.RuntimeInformation.OSDescription
+                HostName     = Environment.MachineName,
+                ServiceName  = "SqlMonitor",
+                AgentVersion = AgentVersion,
+                OsInfo       = System.Runtime.InteropServices.RuntimeInformation.OSDescription,
+                ApiKeyPrefix = _apiKeyPrefix
             };
 
             var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(payload, JsonOpts);
@@ -290,8 +320,18 @@ public sealed class ProactiveApiClient(
             if (!response.IsSuccessStatusCode)
             {
                 var body = await response.Content.ReadAsStringAsync(ct);
-                logger.LogWarning("Agent registration returned {Status}: {Body}",
-                    (int)response.StatusCode, Truncate(body, 200));
+
+                if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                    logger.LogError(
+                        "Agent registration falhou com 401 Unauthorized — " +
+                        "verifique o valor de 'SqlMonitor:ApiKey' no appsettings.json. " +
+                        "A chave deve começar por 'pdb_' e ser fornecida pelo administrador ProactiveDB. " +
+                        "Detalhes: {Body}",
+                        StringHelpers.Truncate(body, 200));
+                else
+                    logger.LogWarning("Agent registration returned {Status}: {Body}",
+                        (int)response.StatusCode, StringHelpers.Truncate(body, 200));
+
                 return null;
             }
 
@@ -361,7 +401,7 @@ public sealed class ProactiveApiClient(
             {
                 var body = await response.Content.ReadAsStringAsync(ct);
                 logger.LogWarning("Heartbeat returned {Status}: {Body}",
-                    (int)response.StatusCode, Truncate(body, 200));
+                    (int)response.StatusCode, StringHelpers.Truncate(body, 200));
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -437,7 +477,7 @@ public sealed class ProactiveApiClient(
             {
                 var body = await response.Content.ReadAsStringAsync(ct);
                 logger.LogWarning("Instance health returned {Status}: {Body}",
-                    (int)response.StatusCode, Truncate(body, 200));
+                    (int)response.StatusCode, StringHelpers.Truncate(body, 200));
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -454,8 +494,8 @@ public sealed class ProactiveApiClient(
         Guid agentId, OsServicesSnapshot snapshot, CancellationToken ct)
     {
         var ts        = snapshot.CollectedAtUtc.ToString("o");
-        int sent      = 0;
-        int failures  = 0;
+        var sent      = 0;
+        var failures  = 0;
 
         foreach (var svc in snapshot.Services)
         {
@@ -492,7 +532,7 @@ public sealed class ProactiveApiClient(
                 {
                     var body = await response.Content.ReadAsStringAsync(ct);
                     logger.LogWarning("OS service [{Name}] returned {Status}: {Body}",
-                        svc.Name, (int)response.StatusCode, Truncate(body, 200));
+                        svc.Name, (int)response.StatusCode, StringHelpers.Truncate(body, 200));
                     failures++;
                 }
             }
@@ -513,6 +553,4 @@ public sealed class ProactiveApiClient(
                 snapshot.OsPlatform, snapshot.Services.Count, sent, failures);
     }
 
-    private static string Truncate(string? s, int max) =>
-        s is null ? "" : s.Length <= max ? s : s[..max] + "…";
 }

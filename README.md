@@ -6,6 +6,8 @@ O **ProactiveDB Agent** é um serviço Windows leve e open source que recolhe te
 
 O Agent foi desenhado para ser simples, eficiente e com baixo consumo de recursos, funcionando de forma semelhante a agentes como o Zabbix Agent — mas totalmente focado em SQL Server.
 
+A partir da versão 1.0.5, um único Agent pode monitorizar **múltiplas instâncias SQL Server** em simultâneo (cada instância com a sua própria connection string e lista de tabelas), através da secção `Instances` em `appsettings.json`. A configuração legada de instância única continua a funcionar sem alterações.
+
 ---
 
 ## 🚀 Comece

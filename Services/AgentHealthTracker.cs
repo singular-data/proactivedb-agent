@@ -27,9 +27,10 @@ public sealed class AgentHealthTracker
     // Record a collection result for one table
     // -------------------------------------------------------------------------
 
-    public void RecordResult(string tableName, bool success, int rowsCollected, long durationMs, string? errorMessage = null)
+    public void RecordResult(string instanceName, string tableName, bool success, int rowsCollected, long durationMs, string? errorMessage = null)
     {
-        var check = _checks.GetOrAdd(tableName, _ => new CheckStatus(tableName));
+        var key   = $"{instanceName}/{tableName}";
+        var check = _checks.GetOrAdd(key, _ => new CheckStatus(instanceName, tableName));
         check.Record(success, rowsCollected, durationMs, errorMessage);
     }
 
@@ -87,7 +88,8 @@ public sealed class CheckStatus
 {
     private readonly Lock _lock = new();
 
-    public string TableName { get; }
+    public string InstanceName { get; }
+    public string TableName    { get; }
     public CheckState State { get; private set; } = CheckState.Unknown;
     public DateTime? LastRunAtUtc { get; private set; }
     public DateTime? LastSuccessAtUtc { get; private set; }
@@ -97,7 +99,11 @@ public sealed class CheckStatus
     public int RowsCollectedLast { get; private set; }
     public long DurationMs { get; private set; }
 
-    public CheckStatus(string tableName) => TableName = tableName;
+    public CheckStatus(string instanceName, string tableName)
+    {
+        InstanceName = instanceName;
+        TableName    = tableName;
+    }
 
     public void Record(bool success, int rowsCollected, long durationMs, string? errorMessage)
     {
@@ -132,6 +138,7 @@ public sealed class CheckStatus
         {
             return new CheckStatusDto
             {
+                InstanceName      = InstanceName,
                 TableName         = TableName,
                 State             = State.ToString(),
                 LastRunAtUtc      = LastRunAtUtc,
@@ -152,15 +159,16 @@ public sealed class CheckStatus
 
 public sealed class CheckStatusDto
 {
-    public string TableName { get; set; } = string.Empty;
-    public string State { get; set; } = "Unknown";
+    public string InstanceName    { get; set; } = string.Empty;
+    public string TableName       { get; set; } = string.Empty;
+    public string State           { get; set; } = "Unknown";
     public DateTime? LastRunAtUtc { get; set; }
     public DateTime? LastSuccessAtUtc { get; set; }
-    public DateTime? LastErrorAtUtc { get; set; }
-    public string? LastErrorMessage { get; set; }
-    public int ConsecutiveErrors { get; set; }
-    public int RowsCollectedLast { get; set; }
-    public long DurationMs { get; set; }
+    public DateTime? LastErrorAtUtc   { get; set; }
+    public string? LastErrorMessage   { get; set; }
+    public int ConsecutiveErrors  { get; set; }
+    public int RowsCollectedLast  { get; set; }
+    public long DurationMs        { get; set; }
 }
 
 public sealed class AgentHealthSummary

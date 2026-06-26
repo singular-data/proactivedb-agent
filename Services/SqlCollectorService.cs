@@ -9,11 +9,12 @@ using SingularData.Proactive.SqlMonitor.Service.Configuration;
 namespace SingularData.Proactive.SqlMonitor.Service.Services;
 
 /// <summary>
-/// For each configured table:
+/// For each configured SQL Server instance, and for each configured table within that instance:
 ///   1. SELECT TOP N unsent rows (sent_monitoring IS NULL OR = 0)
 ///   2. POST them as a JSON batch to the Backend API
 ///   3. UPDATE sent_monitoring = 1/0 and sent_monitoring_desc based on API response
-/// Tables are processed in parallel (up to MaxParallelTables concurrent).
+/// Instances run concurrently (Task.WhenAll or Parallel.ForEachAsync bounded by MaxParallelInstances).
+/// Tables within each instance run concurrently (up to MaxParallelTables concurrent).
 /// Results are reported to AgentHealthTracker for Datadog-style check status.
 /// </summary>
 public sealed class SqlCollectorService(
@@ -72,60 +73,141 @@ public sealed class SqlCollectorService(
     }
 
     // -------------------------------------------------------------------------
+    // Instance resolution — supports both new Instances[] and legacy flat config
+    // -------------------------------------------------------------------------
+
+    private static List<SqlInstanceConfig> ResolveInstances(SqlMonitorOptions opts)
+    {
+        if (opts.Instances.Count > 0)
+            return opts.Instances;
+
+        if (!string.IsNullOrWhiteSpace(opts.ConnectionString))
+        {
+            var cs = new SqlConnectionStringBuilder(opts.ConnectionString);
+            return [new SqlInstanceConfig
+            {
+                Name             = !string.IsNullOrWhiteSpace(cs.DataSource) ? cs.DataSource : "default",
+                ConnectionString = opts.ConnectionString,
+                Tables           = opts.Tables
+            }];
+        }
+
+        return [];
+    }
+
+    // -------------------------------------------------------------------------
 
     public async Task RunCycleAsync(CancellationToken ct)
     {
-        var tables = options.Value.Tables;
-        if (tables.Count == 0)
+        var opts      = options.Value;
+        var instances = ResolveInstances(opts);
+
+        if (instances.Count == 0)
         {
-            logger.LogWarning("No tables configured — skipping cycle");
+            logger.LogWarning("No SQL instances configured — skipping cycle");
             return;
         }
 
-        // Check which tables are allowed by the backend (cached for 5 minutes).
-        // If the API is unreachable, allowedTables is null and we proceed with all.
-        logger.LogInformation("Fetching allowed tables from API/cache for {Count} configured table(s)", tables.Count);
+        // Fetch the API's enabled-table list once for all instances (cached 5 min)
+        logger.LogInformation("Fetching allowed tables from API/cache");
         var allowedTables = await GetAllowedTablesAsync(ct);
-        logger.LogInformation(
-            allowedTables is null
-                ? "Allowed tables unavailable from API/cache — proceeding with all configured tables"
-                : "Allowed tables resolved from API/cache — {Count} table(s) enabled",
-            allowedTables?.Count ?? 0);
 
-        List<TableMonitorConfig> tablesToProcess;
         if (allowedTables is null)
         {
-            tablesToProcess = tables;
+            logger.LogWarning("Allowed tables unavailable from API/cache — proceeding with all configured tables");
         }
         else
         {
-            tablesToProcess = [.. tables.Where(t => allowedTables.Contains(t.TableName))];
-
-            var skipped = tables.Count - tablesToProcess.Count;
-            if (skipped > 0 && logger.IsEnabled(LogLevel.Information))
+            if (logger.IsEnabled(LogLevel.Information))
                 logger.LogInformation(
-                    "{Skipped} table(s) skipped — not enabled in API", skipped);
+                    "Allowed tables resolved from API/cache — {Count} table(s) enabled",
+                    allowedTables.Count);
+        }
+
+        if (opts.MaxParallelInstances <= 0)
+        {
+            await Task.WhenAll(instances.Select(inst =>
+                RunInstanceCycleAsync(inst, allowedTables, opts, ct)));
+        }
+        else
+        {
+            await Parallel.ForEachAsync(
+                instances,
+                new ParallelOptions { MaxDegreeOfParallelism = opts.MaxParallelInstances, CancellationToken = ct },
+                async (inst, token) => await RunInstanceCycleAsync(inst, allowedTables, opts, token));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+
+    private async Task RunInstanceCycleAsync(
+        SqlInstanceConfig instance,
+        HashSet<string>?  allowedTables,
+        SqlMonitorOptions opts,
+        CancellationToken ct)
+    {
+        List<TableMonitorConfig> tablesToProcess;
+
+        var useWildcard = instance.Tables.Count == 0
+            || instance.Tables.Any(t => t.TableName is null or "" or "*");
+
+        if (!useWildcard)
+        {
+            // Explicit table list — filter by API allowlist when available
+            if (allowedTables is null)
+            {
+                tablesToProcess = instance.Tables;
+            }
+            else
+            {
+                tablesToProcess = [.. instance.Tables.Where(t => allowedTables.Contains(t.TableName))];
+
+                var skipped = instance.Tables.Count - tablesToProcess.Count;
+                if (skipped > 0 && logger.IsEnabled(LogLevel.Information))
+                    logger.LogInformation(
+                        "[{Instance}] {Skipped} table(s) skipped — not enabled in API",
+                        instance.Name, skipped);
+            }
+        }
+        else
+        {
+            // No tables configured (or wildcard "*") — discover from the API enabled-tables list
+            if (allowedTables is null)
+            {
+                logger.LogWarning(
+                    "[{Instance}] No tables configured and API table list unavailable — skipping instance",
+                    instance.Name);
+                return;
+            }
+
+            tablesToProcess = [.. allowedTables.Select(t => new TableMonitorConfig { TableName = t })];
+
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation(
+                    "[{Instance}] Tables=* — auto-discovered {Count} table(s) from API",
+                    instance.Name, tablesToProcess.Count);
         }
 
         if (tablesToProcess.Count == 0)
         {
-            logger.LogDebug("No tables to process this cycle");
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug("[{Instance}] No tables to process this cycle", instance.Name);
             return;
         }
 
-        if (logger.IsEnabled(LogLevel.Debug))
-            logger.LogDebug("Starting collection cycle for {Count} table(s)", tablesToProcess.Count);
+        var maxParallelTables = instance.MaxParallelTables ?? opts.MaxParallelTables;
 
-        logger.LogInformation(
-            "Processing {Count} table(s) with MaxParallelTables={Parallel}",
-            tablesToProcess.Count, options.Value.MaxParallelTables);
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation(
+                "[{Instance}] Processing {Count} table(s) with MaxParallelTables={Parallel}",
+                instance.Name, tablesToProcess.Count, maxParallelTables);
 
         var errors = new ConcurrentBag<(string Subject, string Detail)>();
 
         await Parallel.ForEachAsync(
             tablesToProcess,
-            new ParallelOptions { MaxDegreeOfParallelism = options.Value.MaxParallelTables, CancellationToken = ct },
-            async (table, token) => await ProcessTableAsync(table, errors, token));
+            new ParallelOptions { MaxDegreeOfParallelism = maxParallelTables, CancellationToken = ct },
+            async (table, token) => await ProcessTableAsync(instance, table, opts, errors, token));
 
         if (!errors.IsEmpty)
             await SendConsolidatedAlertAsync(errors, ct);
@@ -138,26 +220,28 @@ public sealed class SqlCollectorService(
     // -------------------------------------------------------------------------
 
     private async Task ProcessTableAsync(
+        SqlInstanceConfig instance,
         TableMonitorConfig table,
+        SqlMonitorOptions opts,
         ConcurrentBag<(string Subject, string Detail)> errors,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(table.TableName))
         {
-            logger.LogWarning("A table config entry has no TableName — skipping");
+            logger.LogWarning("[{Instance}] A table config entry has no TableName — skipping", instance.Name);
             return;
         }
 
-        var sw = Stopwatch.StartNew();
+        var sw    = Stopwatch.StartNew();
         var stage = "initializing";
 
         try
         {
-            var cs = new SqlConnectionStringBuilder(options.Value.ConnectionString);
+            var cs = new SqlConnectionStringBuilder(instance.ConnectionString);
 
-            var keyCol = string.IsNullOrWhiteSpace(table.KeyColumn) ? "id" : table.KeyColumn.Trim();
+            var keyCol   = string.IsNullOrWhiteSpace(table.KeyColumn) ? "id" : table.KeyColumn.Trim();
             var fmtTable = FormatTableName(table.TableName);
-            var maxRows = options.Value.MaxRowsPerTable;
+            var maxRows  = instance.MaxRowsPerTable ?? opts.MaxRowsPerTable;
 
             // If Columns is omitted or empty, use SELECT * and strip internal columns at read time
             var explicitColumns = string.IsNullOrWhiteSpace(table.Columns)
@@ -177,12 +261,13 @@ public sealed class SqlCollectorService(
                 WHERE sent_monitoring IS NULL OR sent_monitoring = 0
                 """;
 
-            var rows = new List<Dictionary<string, object?>>();
+            var rows      = new List<Dictionary<string, object?>>();
             var keyValues = new List<object>();
 
-            await using var conn = new SqlConnection(options.Value.ConnectionString);
+            await using var conn = new SqlConnection(instance.ConnectionString);
 
-            logger.LogInformation("[{Table}] Processing started", table.TableName);
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation("[{Instance}] [{Table}] Processing started", instance.Name, table.TableName);
 
             // 1. Connection failure
             try
@@ -193,9 +278,10 @@ public sealed class SqlCollectorService(
             catch (SqlException ex)
             {
                 errors.Add((
-                    $"[ProactiveDB] SQL connection failed — {cs.DataSource}",
+                    $"[ProactiveDB] SQL connection failed — {instance.Name}/{cs.DataSource}",
                     $"SQL Server connection failure on {Environment.MachineName}\n" +
                     $"Time     : {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC\n" +
+                    $"Instance : {instance.Name}\n" +
                     $"Server   : {cs.DataSource}\n" +
                     $"Database : {cs.InitialCatalog}\n" +
                     $"Table    : {table.TableName}\n\n" +
@@ -207,7 +293,7 @@ public sealed class SqlCollectorService(
             try
             {
                 stage = "executing SELECT query";
-                await using var cmd = new SqlCommand(query, conn) { CommandTimeout = 30 };
+                await using var cmd    = new SqlCommand(query, conn) { CommandTimeout = 30 };
                 await using var reader = await cmd.ExecuteReaderAsync(ct);
 
                 while (await reader.ReadAsync(ct))
@@ -232,9 +318,10 @@ public sealed class SqlCollectorService(
             catch (SqlException ex)
             {
                 errors.Add((
-                    $"[ProactiveDB] SQL query failed — {table.TableName}",
+                    $"[ProactiveDB] SQL query failed — {instance.Name}/{table.TableName}",
                     $"SQL query execution failed on {Environment.MachineName}\n" +
                     $"Time     : {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC\n" +
+                    $"Instance : {instance.Name}\n" +
                     $"Server   : {cs.DataSource}\n" +
                     $"Database : {cs.InitialCatalog}\n" +
                     $"Table    : {table.TableName}\n\n" +
@@ -245,73 +332,81 @@ public sealed class SqlCollectorService(
             if (rows.Count == 0)
             {
                 if (logger.IsEnabled(LogLevel.Debug))
-                    logger.LogDebug("[{Table}] No unsent rows found", table.TableName);
+                    logger.LogDebug("[{Instance}] [{Table}] No unsent rows found", instance.Name, table.TableName);
                 // Count as Ok — no rows simply means nothing to send this cycle
-                healthTracker.RecordResult(table.TableName, success: true, rowsCollected: 0, sw.ElapsedMilliseconds);
+                healthTracker.RecordResult(instance.Name, table.TableName, success: true, rowsCollected: 0, sw.ElapsedMilliseconds);
                 return;
             }
 
             if (logger.IsEnabled(LogLevel.Information))
-                logger.LogInformation("[{Table}] Collected {Count} row(s)", table.TableName, rows.Count);
+                logger.LogInformation("[{Instance}] [{Table}] Collected {Count} row(s)", instance.Name, table.TableName, rows.Count);
 
             stage = "sending batch to API";
             var (success, errorMsg) = await apiClient.SendBatchAsync(table.TableName, rows, ct);
 
             // Report health check result regardless of key-column state
-            healthTracker.RecordResult(table.TableName, success, rows.Count, sw.ElapsedMilliseconds, errorMsg);
+            healthTracker.RecordResult(instance.Name, table.TableName, success, rows.Count, sw.ElapsedMilliseconds, errorMsg);
+
+            if (!success && keyValues.Count > 0)
+                logger.LogWarning(
+                    "[{Instance}] [{Table}] Batch rejected — {KeyColumn} values in failed batch: [{Keys}]",
+                    instance.Name, table.TableName, keyCol,
+                    string.Join(", ", keyValues));
 
             if (string.IsNullOrWhiteSpace(keyCol))
             {
                 logger.LogWarning(
-                    "[{Table}] KeyColumn not configured — rows cannot be marked as sent",
-                    table.TableName);
+                    "[{Instance}] [{Table}] KeyColumn not configured — rows cannot be marked as sent",
+                    instance.Name, table.TableName);
                 return;
             }
             if (keyValues.Count == 0)
             {
                 logger.LogWarning(
-                    "[{Table}] No key values found in result (KeyColumn={Key})",
-                    table.TableName, keyCol);
+                    "[{Instance}] [{Table}] No key values found in result (KeyColumn={Key})",
+                    instance.Name, table.TableName, keyCol);
                 return;
             }
 
             // 3. UPDATE failure handled inside
             stage = "updating sent_monitoring status";
-            await UpdateSentStatusAsync(conn, fmtTable, table.TableName, cs, keyCol, keyValues, success, errorMsg, errors, ct);
+            await UpdateSentStatusAsync(conn, fmtTable, instance, table.TableName, cs, keyCol, keyValues, success, errorMsg, errors, ct);
 
-            logger.LogInformation(
-                "[{Table}] Processing completed in {Ms}ms",
-                table.TableName, sw.ElapsedMilliseconds);
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation(
+                    "[{Instance}] [{Table}] Processing completed in {Ms}ms",
+                    instance.Name, table.TableName, sw.ElapsedMilliseconds);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             logger.LogWarning(
-                "[{Table}] Processing cancelled during {Stage} after {Ms}ms",
-                table.TableName, stage, sw.ElapsedMilliseconds);
+                "[{Instance}] [{Table}] Processing cancelled during {Stage} after {Ms}ms",
+                instance.Name, table.TableName, stage, sw.ElapsedMilliseconds);
             throw;
         }
         catch (Exception ex) when (ex is not OperationCanceledException and not SqlException)
         {
             // SqlException alerts are sent at the specific catch sites above; this
             // handles truly unexpected errors (NullReference, serialization, etc.)
-            logger.LogError(ex, "[{Table}] Unhandled error during processing", table.TableName);
+            logger.LogError(ex, "[{Instance}] [{Table}] Unhandled error during processing", instance.Name, table.TableName);
 
-            healthTracker.RecordResult(table.TableName, success: false, rowsCollected: 0,
+            healthTracker.RecordResult(instance.Name, table.TableName, success: false, rowsCollected: 0,
                 sw.ElapsedMilliseconds, $"{ex.GetType().Name}: {ex.Message}");
 
             errors.Add((
-                $"[ProactiveDB] Unexpected error — {table.TableName}",
+                $"[ProactiveDB] Unexpected error — {instance.Name}/{table.TableName}",
                 $"Unexpected error during collection on {Environment.MachineName}\n" +
                 $"Time     : {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC\n" +
+                $"Instance : {instance.Name}\n" +
                 $"Table    : {table.TableName}\n\n" +
                 $"{ex.GetType().Name}: {ex.Message}\n\n{ex.StackTrace}"));
         }
         catch (SqlException ex)
         {
             // SqlException already alerted above — only log here to avoid duplicate emails
-            logger.LogError(ex, "[{Table}] Unhandled error during processing", table.TableName);
+            logger.LogError(ex, "[{Instance}] [{Table}] Unhandled error during processing", instance.Name, table.TableName);
 
-            healthTracker.RecordResult(table.TableName, success: false, rowsCollected: 0,
+            healthTracker.RecordResult(instance.Name, table.TableName, success: false, rowsCollected: 0,
                 sw.ElapsedMilliseconds, $"SQL [{ex.Number}]: {ex.Message}");
         }
     }
@@ -319,6 +414,7 @@ public sealed class SqlCollectorService(
     private async Task UpdateSentStatusAsync(
         SqlConnection conn,
         string fmtTable,
+        SqlInstanceConfig instance,
         string tableName,
         SqlConnectionStringBuilder cs,
         string keyCol,
@@ -329,7 +425,7 @@ public sealed class SqlCollectorService(
         CancellationToken ct)
     {
         var status = success ? 1 : 0;
-        var desc = "sent";
+        var desc   = "sent";
 
         try
         {
@@ -351,8 +447,8 @@ public sealed class SqlCollectorService(
             if (!success && !string.IsNullOrWhiteSpace(errorMsg))
             {
                 logger.LogWarning(
-                    "[{Table}] Failed to send batch to API: {Error}",
-                    tableName, errorMsg);
+                    "[{Instance}] [{Table}] Failed to send batch to API: {Error}",
+                    instance.Name, tableName, errorMsg);
             }
 
             var sql = success
@@ -380,16 +476,17 @@ public sealed class SqlCollectorService(
             {
                 var statusLabel = success ? "sent" : "failed";
                 logger.LogInformation(
-                    "[{Table}] Marked {Updated}/{Total} row(s) as [{Status}]",
-                    fmtTable, updated, keyValues.Count, statusLabel);
+                    "[{Instance}] [{Table}] Marked {Updated}/{Total} row(s) as [{Status}]",
+                    instance.Name, fmtTable, updated, keyValues.Count, statusLabel);
             }
         }
         catch (SqlException ex)
         {
             errors.Add((
-                $"[ProactiveDB] Failed to mark rows — {tableName}",
+                $"[ProactiveDB] Failed to mark rows — {instance.Name}/{tableName}",
                 $"Failed to update sent_monitoring status on {Environment.MachineName}\n" +
                 $"Time     : {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC\n" +
+                $"Instance : {instance.Name}\n" +
                 $"Server   : {cs.DataSource}\n" +
                 $"Database : {cs.InitialCatalog}\n" +
                 $"Table    : {tableName}\n" +
@@ -403,9 +500,9 @@ public sealed class SqlCollectorService(
         ConcurrentBag<(string Subject, string Detail)> errors,
         CancellationToken ct)
     {
-        var items = errors.ToArray();
+        var items   = errors.ToArray();
         var subject = $"[ProactiveDB] {items.Length} collection error(s) on {Environment.MachineName}";
-        var body = string.Join(
+        var body    = string.Join(
             "\n\n" + new string('-', 60) + "\n\n",
             items.Select((e, i) => $"[{i + 1}/{items.Length}] {e.Subject}\n\n{e.Detail}"));
 
@@ -414,10 +511,10 @@ public sealed class SqlCollectorService(
 
     private static string ToSqlTypeName(Type type)
     {
-        if (type == typeof(int))    return "INT";
-        if (type == typeof(long))   return "BIGINT";
-        if (type == typeof(short))  return "SMALLINT";
-        if (type == typeof(Guid))   return "UNIQUEIDENTIFIER";
+        if (type == typeof(int))   return "INT";
+        if (type == typeof(long))  return "BIGINT";
+        if (type == typeof(short)) return "SMALLINT";
+        if (type == typeof(Guid))  return "UNIQUEIDENTIFIER";
         return "NVARCHAR(450)";
     }
 
@@ -439,7 +536,4 @@ public sealed class SqlCollectorService(
         byte[] b => Convert.ToBase64String(b),
         _ => value
     };
-
-    private static string Truncate(string? s, int max) =>
-        s is null ? string.Empty : s.Length <= max ? s : s[..max];
 }

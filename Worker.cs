@@ -34,18 +34,24 @@ public sealed class Worker(
         // ── Startup banner ────────────────────────────────────────────────────
         if (logger.IsEnabled(LogLevel.Information))
         {
-            var pid     = proc.Id;
-            var machine = Environment.MachineName;
-            var user    = Environment.UserName;
-            var runtime = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription;
-            var exePath = proc.MainModule?.FileName ?? "unknown";
+            var pid           = proc.Id;
+            var machine       = Environment.MachineName;
+            var user          = Environment.UserName;
+            var runtime       = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription;
+            var exePath       = proc.MainModule?.FileName ?? "unknown";
+            var instanceCount = opts.Instances.Count > 0 ? opts.Instances.Count : 1;
+            var totalTables   = opts.Instances.Count > 0
+                ? opts.Instances.Sum(i => i.Tables.Count)
+                : opts.Tables.Count;
+
             logger.LogInformation(
                 "=== SQL Monitor starting — PID={Pid} Machine={Machine} User={User} Runtime={Runtime} Exe={Exe} ===",
                 pid, machine, user, runtime, exePath);
 
             logger.LogInformation(
-                "Config — interval={Interval}min maxRows={Max} maxParallel={Parallel} tables={Tables}",
-                opts.PollIntervalMinutes, opts.MaxRowsPerTable, opts.MaxParallelTables, opts.Tables.Count);
+                "Config — interval={Interval}min maxRows={Max} maxParallelTables={Parallel} maxParallelInstances={MaxInst} instances={Instances} tables={Tables}",
+                opts.PollIntervalMinutes, opts.MaxRowsPerTable, opts.MaxParallelTables,
+                opts.MaxParallelInstances, instanceCount, totalTables);
         }
 
         // ── Lifecycle events (fire-and-forget callbacks from the host) ────────

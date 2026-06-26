@@ -30,9 +30,28 @@ var host = Host.CreateDefaultBuilder(args)
     })
     .ConfigureServices((ctx, services) =>
     {
-        // Bind configuration section
-        services.Configure<SqlMonitorOptions>(
-            ctx.Configuration.GetSection(SqlMonitorOptions.SectionName));
+        // Bind and validate configuration at startup — fail fast before any service runs
+        services.AddOptions<SqlMonitorOptions>()
+            .BindConfiguration(SqlMonitorOptions.SectionName)
+            .Validate(
+                o =>
+                {
+                    if (string.IsNullOrWhiteSpace(o.ApiBaseUrl) || string.IsNullOrWhiteSpace(o.ApiKey))
+                        return false;
+
+                    // New multi-instance config: every instance needs a Name and ConnectionString
+                    if (o.Instances.Count > 0)
+                        return o.Instances.All(i =>
+                            !string.IsNullOrWhiteSpace(i.Name) &&
+                            !string.IsNullOrWhiteSpace(i.ConnectionString));
+
+                    // Legacy flat config: just needs a ConnectionString
+                    return !string.IsNullOrWhiteSpace(o.ConnectionString);
+                },
+                "SqlMonitor: ApiBaseUrl and ApiKey are required. " +
+                "Configure either Instances[] (each with Name and ConnectionString) " +
+                "or the legacy ConnectionString field.")
+            .ValidateOnStart();
 
         // Typed HttpClient for Backend API
         // BaseAddress and X-Api-Key are set from config at resolution time
@@ -102,25 +121,12 @@ var host = Host.CreateDefaultBuilder(args)
 
         services.AddSingleton<AgentHealthTracker>();
         services.AddSingleton<SqlCollectorService>();
+        services.AddSingleton<SqlInstanceCollector>();
         services.AddSingleton<OsServicesCollector>();
         services.AddHostedService<Worker>();
     })
     .Build();
 
-// Validate required configuration before starting — fail fast with a clear message
-// rather than crashing deep inside a service on the first request.
-var opts = host.Services.GetRequiredService<IOptions<SqlMonitorOptions>>().Value;
-
-if (string.IsNullOrWhiteSpace(opts.ConnectionString))
-    throw new InvalidOperationException(
-        "SqlMonitor:ConnectionString is not set in appsettings.json");
-
-if (string.IsNullOrWhiteSpace(opts.ApiBaseUrl))
-    throw new InvalidOperationException(
-        "SqlMonitor:ApiBaseUrl is not set in appsettings.json");
-
-if (string.IsNullOrWhiteSpace(opts.ApiKey))
-    throw new InvalidOperationException(
-        "SqlMonitor:ApiKey is not set in appsettings.json");
-
+// ValidateOnStart() (configurado acima) já garante que o serviço falha antes de
+// iniciar caso as definições obrigatórias estejam em falta.
 await host.RunAsync();
